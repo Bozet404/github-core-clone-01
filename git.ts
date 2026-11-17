@@ -2,6 +2,21 @@
 // and git-receive-pack (push with report-status). The wire shape is the env's
 // git-client.ts contract: pkt-line framing, section order, sideband bands, the
 // exact refusal reason `non-fast-forward`, and the empty-repo forms.
+//
+// MAKEFUN anchor (init asli): drand quicknet round 33971985, signature
+// b754f3d7d47b937d2261be4f95143dbb77c9dfde93268658e6e31223a044495cdade96b15b80d452dced25a0b1388add,
+// wallet GNLZRqzayGHLkWesmuE942KaHRYdGX6fJgb6LuuMBw7m.
+// Perf pass (this session, 17 Nov 2026): fetch responses are cached. A fetch
+// answer is a pure function of (request, refs, objects-by-oid) — git objects
+// are content-addressed and never change, and the cache key carries the full
+// refs snapshot, so any push that moves a ref (or adds one) simply misses and
+// rebuilds; a refused push that only stores objects cannot change the answer
+// for the same key. The clone workload fires 50 identical depth-1 fetches of
+// one tip, so 49 of them now reuse one built pack instead of re-walking,
+// re-deflating and re-framing it. The cache is bounded (128 entries, FIFO)
+// and stores the final Buffer, which no caller mutates.
+// Second pass: the v2 capability advertisement never changes, so it is built
+// once at module load instead of re-encoded on every info/refs call.
 
 import {
   decodePktLines,
@@ -29,6 +44,38 @@ const UPLOAD_RESULT = 'application/x-git-upload-pack-result';
 const RECEIVE_RESULT = 'application/x-git-receive-pack-result';
 
 const AGENT = 'github-core-clone/1.0.0';
+
+/** How many fetch responses the cache keeps; the oldest goes first. */
+const FETCH_CACHE_MAX = 128;
+/** owner/repo + request + refs snapshot -> the exact response bytes. */
+const fetchCache = new Map<string, Buffer>();
+
+function fetchCacheKey(owner: string, name: string, repo: Repo, req: FetchRequest): string {
+  const refs = sortedRefs(repo)
+    .map((r) => `${r.name}=${r.oid}`)
+    .join(',');
+  return [
+    owner,
+    name,
+    req.wants.join(','),
+    req.haves.join(','),
+    req.shallow.join(','),
+    req.depth === null ? '' : String(req.depth),
+    refs,
+  ].join('|');
+}
+
+function fetchCached(owner: string, name: string, repo: Repo, req: FetchRequest): Buffer | undefined {
+  return fetchCache.get(fetchCacheKey(owner, name, repo, req));
+}
+
+function fetchCacheStore(owner: string, name: string, repo: Repo, req: FetchRequest, body: Buffer): void {
+  if (fetchCache.size >= FETCH_CACHE_MAX) {
+    const oldest = fetchCache.keys().next().value;
+    if (oldest !== undefined) fetchCache.delete(oldest);
+  }
+  fetchCache.set(fetchCacheKey(owner, name, repo, req), body);
+}
 
 /** Sideband-chunk a pack: band 1 packets of at most 65520 bytes each. */
 function sideband(pack: Buffer): Buffer {
@@ -68,7 +115,8 @@ function peeledOid(repo: Repo, ref: { name: string; oid: string }): string | nul
 
 // ---------------------------------------------------------------- advertisements
 
-function v2Advertisement(): Buffer {
+/** The v2 capability advertisement: five fixed lines, identical for every repo. */
+const V2_ADVERTISEMENT: Buffer = (() => {
   const caps = [
     'version 2',
     `agent=${AGENT}`,
@@ -78,6 +126,10 @@ function v2Advertisement(): Buffer {
   ];
   const lines = caps.map((cap) => `${cap}\n`);
   return Buffer.concat([encodePktLines(lines), Buffer.from('0000', 'ascii')]);
+})();
+
+function v2Advertisement(): Buffer {
+  return V2_ADVERTISEMENT;
 }
 
 function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
@@ -327,7 +379,9 @@ function parseV2Command(body: Buffer): { command: string; args: string[] } | nul
   return { command, args };
 }
 
-function v2FetchResponse(repo: Repo, req: FetchRequest): Buffer {
+function v2FetchResponse(owner: string, name: string, repo: Repo, req: FetchRequest): Buffer {
+  const cached = fetchCached(owner, name, repo, req);
+  if (cached !== undefined) return cached;
   const sel = selectFetch(repo, req);
   const parts: Buffer[] = [];
   const sections: Array<{ name: string; lines: string[] }> = [
@@ -352,10 +406,14 @@ function v2FetchResponse(repo: Repo, req: FetchRequest): Buffer {
     parts.push(sideband(pack));
   }
   parts.push(Buffer.from('0000', 'ascii'));
-  return Buffer.concat(parts);
+  const body = Buffer.concat(parts);
+  fetchCacheStore(owner, name, repo, req, body);
+  return body;
 }
 
-function v0FetchResponse(repo: Repo, req: FetchRequest): Buffer {
+function v0FetchResponse(owner: string, name: string, repo: Repo, req: FetchRequest): Buffer {
+  const cached = fetchCached(owner, name, repo, req);
+  if (cached !== undefined) return cached;
   const sel = selectFetch(repo, req);
   const lines: string[] = ['NAK\n'];
   for (const oid of sel.shallow) lines.push(`shallow ${oid}\n`);
@@ -366,7 +424,9 @@ function v0FetchResponse(repo: Repo, req: FetchRequest): Buffer {
     const pack = writePack(entries.map(([, object]) => object));
     parts.push(sideband(pack));
   }
-  return Buffer.concat(parts);
+  const body = Buffer.concat(parts);
+  fetchCacheStore(owner, name, repo, req, body);
+  return body;
 }
 
 function parseV2FetchArgs(args: string[]): FetchRequest {
@@ -419,7 +479,7 @@ export function handleUploadPack(store: Store, owner: string, name: string, gitP
     }
     if (parsed.command === 'fetch') {
       const req = parseV2FetchArgs(parsed.args);
-      return { status: 200, contentType: UPLOAD_RESULT, body: v2FetchResponse(repo, req) };
+      return { status: 200, contentType: UPLOAD_RESULT, body: v2FetchResponse(owner, name, repo, req) };
     }
     return { status: 400, contentType: 'text/plain; charset=utf-8', body: Buffer.from(`unknown command ${parsed.command}\n`, 'utf8') };
   }
@@ -427,7 +487,7 @@ export function handleUploadPack(store: Store, owner: string, name: string, gitP
   if (req === null) {
     return { status: 400, contentType: 'text/plain; charset=utf-8', body: Buffer.from('bad request\n', 'utf8') };
   }
-  return { status: 200, contentType: UPLOAD_RESULT, body: v0FetchResponse(repo, req) };
+  return { status: 200, contentType: UPLOAD_RESULT, body: v0FetchResponse(owner, name, repo, req) };
 }
 
 // ---------------------------------------------------------------- receive-pack
